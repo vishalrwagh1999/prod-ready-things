@@ -293,7 +293,7 @@ Pod  -->  Service Account  -->  IAM Role (via OIDC)  -->  AWS API
 
 ### Step 1 — Download the Load Balancer Controller IAM Policy
 
-```bash
+```yaml
 # curl -O https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/v2.7.2/docs/install/iam_policy.json
 curl -o iam_policy.json https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/main/docs/install/iam_policy.json
 ```
