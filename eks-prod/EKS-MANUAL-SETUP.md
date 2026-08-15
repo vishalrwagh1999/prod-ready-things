@@ -5,6 +5,74 @@ It covers every IAM role, what it does, OIDC identity provider, service accounts
 
 ---
 
+## How 2 Apps + 1 Load Balancer Work Together
+
+This is the core concept of this entire guide — **one ALB routing traffic to two different apps based on the URL path**.
+
+### The Flow
+
+```
+                        USER BROWSER
+                             |
+              +--------------+--------------+
+              |                             |
+   /app1 request                      /app2 request
+              |                             |
+              v                             v
+   +---------------------------------------------+
+   |        AWS ALB (Application Load Balancer)   |
+   |   k8s-default-demoalb-212300ed89-430070403   |
+   |          .us-west-2.elb.amazonaws.com        |
+   +---------------------------------------------+
+              |                             |
+     path: /app1                      path: /app2
+              |                             |
+              v                             v
+   +--------------------+       +--------------------+
+   |   app1-service     |       |   app2-service     |
+   |   (ClusterIP:80)   |       |   (ClusterIP:80)   |
+   +--------------------+       +--------------------+
+              |                             |
+     targetPort: 5678             targetPort: 5678
+              |                             |
+    +---------+---------+       +-----------+---------+
+    |                   |       |                     |
+    v                   v       v                     v
+ +-------+          +-------+ +-------+          +-------+
+ | app1  |          | app1  | | app2  |          | app2  |
+ | pod-1 |          | pod-2 | | pod-1 |          | pod-2 |
+ +-------+          +-------+ +-------+          +-------+
+  (replica 1)      (replica 2)  (replica 1)      (replica 2)
+```
+
+### Step-by-Step What Happens
+
+| Step | What happens |
+|------|--------------|
+| 1 | You run `kubectl apply -f app1.yml` → Kubernetes creates 2 app1 pods + `app1-service` (ClusterIP) |
+| 2 | You run `kubectl apply -f app2.yml` → Kubernetes creates 2 app2 pods + `app2-service` (ClusterIP) |
+| 3 | You run `kubectl apply -f ingress.yml` → AWS Load Balancer Controller sees the Ingress object |
+| 4 | LBC calls AWS API → creates **one real ALB** in your AWS account automatically |
+| 5 | ALB is configured with **path-based routing rules** from your ingress YAML |
+| 6 | User hits `/app1` → ALB forwards to `app1-service` → reaches app1 pods |
+| 7 | User hits `/app2` → ALB forwards to `app2-service` → reaches app2 pods |
+
+### Why ClusterIP and not NodePort/LoadBalancer?
+
+- `ClusterIP` = internal-only service, not exposed to internet directly
+- The **ALB talks directly to pod IPs** (because `target-type: ip` is set in ingress)
+- No need to expose each service publicly — the single ALB handles all external traffic
+- This is the **recommended production pattern** — one ALB, many apps, path-based routing
+
+### Live URLs (This Demo)
+
+| Path | URL | Response |
+|------|-----|----------|
+| `/app1` | http://k8s-default-demoalb-212300ed89-430070403.us-west-2.elb.amazonaws.com/app1 | `Welcome to App 1 - DevOps Vishal` |
+| `/app2` | http://k8s-default-demoalb-212300ed89-430070403.us-west-2.elb.amazonaws.com/app2 | `Welcome to App 2 - AWS Load Balancer Controller Demo` |
+
+---
+
 ## Big Picture — What Are We Building?
 
 ```
@@ -427,7 +495,7 @@ spec:
                 port:
                   number: 80
 ```
-jadeja app1 and app2 with ingress for 2 applications ans one LB
+vishal app1 and app2 with ingress for 2 applications and one LB
 
 app1.yml
 ```yaml
@@ -449,7 +517,7 @@ spec:
       - name: app1
         image: hashicorp/http-echo:1.0
         args:
-          - "-text=Welcome to App 1 - DevOps Jadeja"
+          - "-text=Welcome to App 1 - DevOps Vishal"
         ports:
         - containerPort: 5678
 ---
