@@ -553,6 +553,17 @@ Open that ADDRESS in your browser — that is your app!
 
 ---
 
+## Live Demo URLs
+
+Both apps are live and accessible via the ALB:
+
+| App | URL |
+|-----|-----|
+| App 1 | http://k8s-default-demoalb-212300ed89-430070403.us-west-2.elb.amazonaws.com/app1 |
+| App 2 | http://k8s-default-demoalb-212300ed89-430070403.us-west-2.elb.amazonaws.com/app2 |
+
+---
+
 ## Summary — All Roles at a Glance
 
 | Role | Used By | Purpose |
