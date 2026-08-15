@@ -1,0 +1,285 @@
+# =============================================================================
+# Azure DevOps Pipeline — Terraform ACR Deployment
+# Agent        : Self-hosted (SelfHosted-ec2)
+# Service Conn : AzureDevopsToAzurePortal-SC
+# Trigger      : Manual only
+# Repo path    : <your-repo>/terraform/
+# =============================================================================
+
+trigger: none
+pr:     none
+
+# ---------------------------------------------------------------------------
+# Runtime parameters — dropdown choices in "Run pipeline" UI
+# ---------------------------------------------------------------------------
+parameters:
+  - name: tf_action
+    displayName: "Terraform Action"
+    type: string
+    default: plan
+    values:
+      - init
+      - plan
+      - apply
+      - destroy
+
+  - name: environment
+    displayName: "Target Environment"
+    type: string
+    default: dev
+    values:
+      - dev
+      - staging
+      - prod
+
+# ---------------------------------------------------------------------------
+# Pipeline-level variables
+# ---------------------------------------------------------------------------
+variables:
+  TF_WORKING_DIR:           "$(Build.SourcesDirectory)/terraform"
+  BACKEND_RG:               "tfstate-rg"
+  BACKEND_STORAGE_ACCOUNT:  "tfstatevishal"
+  BACKEND_CONTAINER:        "tfstate-files-azure-devops"
+  BACKEND_STATE_KEY:        "${{ parameters.environment }}/acr/terraform.tfstate"
+  SERVICE_CONNECTION:       "AzureDevopsToAzurePortal-SC"
+  ARM_SUBSCRIPTION_ID:      "dd2551df-8268-493c-8922-89d2ce59be45"
+
+# ---------------------------------------------------------------------------
+# Self-hosted agent pool
+# ---------------------------------------------------------------------------
+pool:
+  name: SelfHosted-ec2
+
+# ---------------------------------------------------------------------------
+# Stages
+# ---------------------------------------------------------------------------
+stages:
+
+# ============================================================
+# STAGE 1 — Validate: print run summary
+# ============================================================
+- stage: Validate
+  displayName: "🔍 Validate"
+  jobs:
+    - job: PrintSummary
+      displayName: "Print run summary"
+      steps:
+        - checkout: none
+        - script: |
+            echo "=============================================="
+            echo "  Terraform Action  : ${{ parameters.tf_action }}"
+            echo "  Environment       : ${{ parameters.environment }}"
+            echo "  Working Dir       : $(TF_WORKING_DIR)"
+            echo "  State Key         : $(BACKEND_STATE_KEY)"
+            echo "  Storage Account   : $(BACKEND_STORAGE_ACCOUNT)"
+            echo "  Container         : $(BACKEND_CONTAINER)"
+            echo "  Backend RG        : $(BACKEND_RG)"
+            echo "  Subscription ID   : $(ARM_SUBSCRIPTION_ID)"
+            echo "  Service Connection: $(SERVICE_CONNECTION)"
+            echo "  Branch            : $(Build.SourceBranchName)"
+            echo "  Triggered by      : $(Build.RequestedFor)"
+            echo "=============================================="
+          displayName: "📋 Run Summary"
+
+# ============================================================
+# STAGE 2 — Terraform Init
+# Runs for ALL actions
+# ============================================================
+- stage: TerraformInit
+  displayName: "⚙️ Terraform Init"
+  dependsOn: Validate
+  condition: succeeded()
+  jobs:
+    - job: Init
+      displayName: "terraform init"
+      steps:
+        - checkout: self
+
+        - task: TerraformInstaller@1
+          displayName: "Install Terraform (latest)"
+          inputs:
+            terraformVersion: "latest"
+
+        - task: TerraformTaskV4@4
+          displayName: "terraform init"
+          inputs:
+            provider:                           "azurerm"
+            command:                            "init"
+            workingDirectory:                   "$(TF_WORKING_DIR)"
+            backendServiceArm:                  "$(SERVICE_CONNECTION)"
+            backendAzureRmResourceGroupName:    "$(BACKEND_RG)"
+            backendAzureRmStorageAccountName:   "$(BACKEND_STORAGE_ACCOUNT)"
+            backendAzureRmContainerName:        "$(BACKEND_CONTAINER)"
+            backendAzureRmKey:                  "$(BACKEND_STATE_KEY)"
+
+# ============================================================
+# STAGE 3 — Terraform Plan
+# Runs for: plan, apply, destroy
+# ============================================================
+- stage: TerraformPlan
+  displayName: "📝 Terraform Plan"
+  dependsOn: TerraformInit
+  condition: |
+    and(
+      succeeded(),
+      in('${{ parameters.tf_action }}', 'plan', 'apply', 'destroy')
+    )
+  jobs:
+    - job: Plan
+      displayName: "terraform plan"
+      steps:
+        - checkout: self
+
+        - task: TerraformInstaller@1
+          displayName: "Install Terraform (latest)"
+          inputs:
+            terraformVersion: "latest"
+
+        - task: TerraformTaskV4@4
+          displayName: "terraform init (re-init on fresh agent workspace)"
+          inputs:
+            provider:                           "azurerm"
+            command:                            "init"
+            workingDirectory:                   "$(TF_WORKING_DIR)"
+            backendServiceArm:                  "$(SERVICE_CONNECTION)"
+            backendAzureRmResourceGroupName:    "$(BACKEND_RG)"
+            backendAzureRmStorageAccountName:   "$(BACKEND_STORAGE_ACCOUNT)"
+            backendAzureRmContainerName:        "$(BACKEND_CONTAINER)"
+            backendAzureRmKey:                  "$(BACKEND_STATE_KEY)"
+
+        - task: TerraformTaskV4@4
+          displayName: "terraform plan"
+          inputs:
+            provider:                       "azurerm"
+            command:                        "plan"
+            workingDirectory:               "$(TF_WORKING_DIR)"
+            commandOptions: >
+              -var="subscription_id=$(ARM_SUBSCRIPTION_ID)"
+              -var-file="terraform.tfvars"
+              -out=$(Build.ArtifactStagingDirectory)/tfplan
+            environmentServiceNameAzureRM:  "$(SERVICE_CONNECTION)"
+
+        - task: PublishPipelineArtifact@1
+          displayName: "📦 Publish tfplan artifact"
+          inputs:
+            targetPath:      "$(Build.ArtifactStagingDirectory)/tfplan"
+            artifact:        "tfplan-${{ parameters.environment }}"
+            publishLocation: "pipeline"
+
+# ============================================================
+# STAGE 4 — Terraform Apply
+# Runs only when: action = apply
+# Prod gets ManualValidation gate; dev/staging run directly
+# ============================================================
+- stage: TerraformApply
+  displayName: "🚀 Terraform Apply"
+  dependsOn: TerraformPlan
+  condition: |
+    and(
+      succeeded(),
+      eq('${{ parameters.tf_action }}', 'apply')
+    )
+  jobs:
+    # -- Manual approval only for prod --
+    - ${{ if eq(parameters.environment, 'prod') }}:
+      - job: WaitForApproval
+        displayName: "⏸ Manual Approval (prod)"
+        pool: server
+        timeoutInMinutes: 1440
+        steps:
+          - task: ManualValidation@0
+            displayName: "Approve prod apply"
+            inputs:
+              instructions: |
+                Review the tfplan artifact before approving.
+                Environment : prod
+                ACR Name    : votingAppVishal
+                Action      : apply
+              onTimeout: "reject"
+
+    - job: Apply
+      displayName: "terraform apply"
+      ${{ if eq(parameters.environment, 'prod') }}:
+        dependsOn: WaitForApproval
+      steps:
+        - checkout: self
+
+        - task: TerraformInstaller@1
+          displayName: "Install Terraform (latest)"
+          inputs:
+            terraformVersion: "latest"
+
+        - task: DownloadPipelineArtifact@2
+          displayName: "📥 Download tfplan artifact"
+          inputs:
+            artifact: "tfplan-${{ parameters.environment }}"
+            path:     "$(Pipeline.Workspace)/tfplan"
+
+        - task: TerraformTaskV4@4
+          displayName: "terraform init (re-init)"
+          inputs:
+            provider:                           "azurerm"
+            command:                            "init"
+            workingDirectory:                   "$(TF_WORKING_DIR)"
+            backendServiceArm:                  "$(SERVICE_CONNECTION)"
+            backendAzureRmResourceGroupName:    "$(BACKEND_RG)"
+            backendAzureRmStorageAccountName:   "$(BACKEND_STORAGE_ACCOUNT)"
+            backendAzureRmContainerName:        "$(BACKEND_CONTAINER)"
+            backendAzureRmKey:                  "$(BACKEND_STATE_KEY)"
+
+        - task: TerraformTaskV4@4
+          displayName: "terraform apply"
+          inputs:
+            provider:                       "azurerm"
+            command:                        "apply"
+            workingDirectory:               "$(TF_WORKING_DIR)"
+            commandOptions:                 "-auto-approve $(Pipeline.Workspace)/tfplan/tfplan"
+            environmentServiceNameAzureRM:  "$(SERVICE_CONNECTION)"
+
+# ============================================================
+# STAGE 5 — Terraform Destroy
+# Runs only when: action = destroy
+# No approval gate — runs directly (as per your choice)
+# ============================================================
+- stage: TerraformDestroy
+  displayName: "💣 Terraform Destroy"
+  dependsOn: TerraformPlan
+  condition: |
+    and(
+      succeeded(),
+      eq('${{ parameters.tf_action }}', 'destroy')
+    )
+  jobs:
+    - job: Destroy
+      displayName: "terraform destroy"
+      steps:
+        - checkout: self
+
+        - task: TerraformInstaller@1
+          displayName: "Install Terraform (latest)"
+          inputs:
+            terraformVersion: "latest"
+
+        - task: TerraformTaskV4@4
+          displayName: "terraform init (re-init)"
+          inputs:
+            provider:                           "azurerm"
+            command:                            "init"
+            workingDirectory:                   "$(TF_WORKING_DIR)"
+            backendServiceArm:                  "$(SERVICE_CONNECTION)"
+            backendAzureRmResourceGroupName:    "$(BACKEND_RG)"
+            backendAzureRmStorageAccountName:   "$(BACKEND_STORAGE_ACCOUNT)"
+            backendAzureRmContainerName:        "$(BACKEND_CONTAINER)"
+            backendAzureRmKey:                  "$(BACKEND_STATE_KEY)"
+
+        - task: TerraformTaskV4@4
+          displayName: "terraform destroy"
+          inputs:
+            provider:                       "azurerm"
+            command:                        "destroy"
+            workingDirectory:               "$(TF_WORKING_DIR)"
+            commandOptions: >
+              -auto-approve
+              -var="subscription_id=$(ARM_SUBSCRIPTION_ID)"
+              -var-file="terraform.tfvars"
+            environmentServiceNameAzureRM:  "$(SERVICE_CONNECTION)"

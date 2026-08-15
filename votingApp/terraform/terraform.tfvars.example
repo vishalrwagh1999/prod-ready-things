@@ -1,0 +1,35 @@
+# Copy this file to terraform.tfvars and fill in your values
+# DO NOT commit terraform.tfvars — it is in .gitignore
+
+resource_group_name = "voting-app-rg"
+acr_name            = "votingAppVishal"
+sku                 = "Basic"
+location            = "East US"
+
+aks_cluster_name = "voting-aks"
+aks_dns_prefix   = "votingaks"
+node_count       = 2
+vm_size          = "Standard_D2s_v3"
+
+# Your public IP or corporate VPN CIDR — restricts AKS API server access
+api_server_authorized_ip_ranges = ["<YOUR_PUBLIC_IP>/32"]
+
+postgres_server_name    = "<UNIQUE_POSTGRES_NAME>"
+postgres_database_name  = "votingdb"
+redis_cache_name        = "<UNIQUE_REDIS_NAME>"
+
+# Updated after first terraform apply with real AKS outbound IP
+# az network public-ip show --ids <id> --query ipAddress -o tsv
+aks_outbound_ip = "<AKS_OUTBOUND_IP>"
+
+tags = {
+  Project     = "VotingApp"
+  Owner       = "<YOUR_NAME>"
+  Environment = "dev"
+  ManagedBy   = "Terraform"
+}
+
+# Secrets — pass via environment variables, NEVER set here:
+#   $env:TF_VAR_subscription_id="<YOUR_SUBSCRIPTION_ID>"
+#   $env:TF_VAR_postgres_admin_username="<DB_USERNAME>"
+#   $env:TF_VAR_postgres_admin_password="<STRONG_PASSWORD>"

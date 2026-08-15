@@ -1,0 +1,22 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: voting-app
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://vishalrwagh1999@dev.azure.com/vishalrwagh1999/vishal_project/_git/votingApp
+    targetRevision: main
+    path: k8s-specifications
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: voting-app
+  syncPolicy:
+    automated:
+      prune: true        # delete resources removed from git
+      selfHeal: true     # auto fix drift from desired state
+    syncOptions:
+      - CreateNamespace=true
