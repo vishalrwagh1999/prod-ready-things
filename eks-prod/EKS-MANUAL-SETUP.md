@@ -42,7 +42,7 @@ EKS needs multiple IAM roles. Here is each one, what it is, and why it exists.
 
 ---
 
-### Role 1 — EKS Cluster Role
+### Role 1 — EKS Cluster Role (for control plane)
 
 **What it is:** An IAM role that the EKS control plane (master nodes managed by AWS) uses.
 
