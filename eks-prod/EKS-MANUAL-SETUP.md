@@ -328,12 +328,12 @@ eksctl create iamserviceaccount \
   --approve \
   --region us-west-2
 ```
+Manual : IAM >> Roles >> web identity >> Identity provider and sts of our cluser >> AWSLoadBalancerControllerIAMPolicy (created manually step2 ) >> role-name AmazonEKSLoadBalancerControllerRole >> create
 
 **Verify the service account was created:**
 ```bash
 kubectl get serviceaccount aws-load-balancer-controller -n kube-system -o yaml
 ```
-Manual : IAM >> Roles >> web identity >> Identity provider and sts of our cluser >> AWSLoadBalancerControllerIAMPolicy (created manually step2 ) >> role-name AmazonEKSLoadBalancerControllerRole >> create
 
 You should see an annotation like:
 ```yaml
