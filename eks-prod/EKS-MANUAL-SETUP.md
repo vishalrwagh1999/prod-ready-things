@@ -309,6 +309,7 @@ Note down the policy ARN from the output:
 ```
 arn:aws:iam::<ACCOUNT_ID>:policy/AWSLoadBalancerControllerIAMPolicy
 ```
+Manually : IAM >> Poilicy > create new >> name : AWSLoadBalancerControllerIAMPolicy >> copy paste url contents in json and save it
 
 ### Step 3 — Create the Service Account + IAM Role (IRSA)
 
