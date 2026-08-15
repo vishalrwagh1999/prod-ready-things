@@ -257,8 +257,8 @@ Output looks like:
 https://oidc.eks.us-west-2.amazonaws.com/id/EXAMPLED539D4633E53DE1B716D3041E
 ```
 
-### Step 2 — Create the OIDC Provider in IAM |  IAM 
-manually : IAM >> Provider type: Select OpenID >> Connect.Provider URL: Paste the OIDC issuer URL you copied from EKS.Audience: >> Enter sts.amazonaws.com 
+### Step 2 — Create the OIDC Provider in IAM |  manual below 
+manually : IAM >> Provider type: Select OpenID >> Connect.Provider URL: Paste the OIDC issuer URL you copied EKS >> Audience: >> Enter sts.amazonaws.com 
 
 
 ```bash
