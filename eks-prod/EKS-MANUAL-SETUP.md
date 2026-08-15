@@ -243,7 +243,7 @@ Pod uses Service Account
    IAM Role is assumed  -->  Pod gets AWS permissions
 ```
 
-### Step 1 — Get the OIDC Issuer URL
+### Step 1 — Get the OIDC Issuer URL below command | manually >> cluster >> OpenID Connect provider URL
 
 ```bash
 aws eks describe-cluster \
@@ -257,7 +257,11 @@ Output looks like:
 https://oidc.eks.us-west-2.amazonaws.com/id/EXAMPLED539D4633E53DE1B716D3041E
 ```
 
-### Step 2 — Create the OIDC Provider in IAM
+### Step 2 — Create the OIDC Provider in IAM |  
+manually Provider type: Select OpenID 
+Connect.Provider URL: Paste the OIDC issuer URL you copied from EKS.Audience: 
+Enter sts.amazonaws.com 
+IAM >> Identity providers >> Audience:  sts.amazonaws.com
 
 ```bash
 eksctl utils associate-iam-oidc-provider \
