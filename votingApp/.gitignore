@@ -1,0 +1,26 @@
+*.pyc
+project.lock.json
+bin/
+obj/
+.vs/
+node_modules/
+
+# Terraform — never commit these
+**/.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfstate.lock.info
+tfplan
+override.tf
+override.tf.json
+
+# terraform.tfvars may contain IPs or sensitive overrides
+# Commit terraform.tfvars.example instead
+terraform/terraform.tfvars
+
+# ArgoCD secret contains credentials — never commit
+terraform/scripts/argocd-repo-secret.yaml
+
+# Local env files
+.env
+.env.*

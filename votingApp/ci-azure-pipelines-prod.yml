@@ -1,0 +1,390 @@
+# ============================================================
+# Production CI Pipeline — VotingApp
+# Stages: SecretScan → SAST → SCA → Test → Build → ContainerScan → Push
+# ============================================================
+
+trigger:
+  branches:
+    include:
+      - main
+      - release/*
+  paths:
+    include:
+      - vote/*
+      - result/*
+      - worker/*
+
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - vote/*
+      - result/*
+      - worker/*
+
+# ── Variable Group stored in Azure DevOps Library ──
+# Library → votingapp-ci-variables must contain:
+#   ACR_SERVICE_CONNECTION  — name of your ACR service connection
+#   NOTIFICATION_EMAIL      — email for failure alerts
+variables:
+  - group: votingapp-ci-variables
+  - name: tag
+    value: '$(Build.BuildId)'
+  - name: imageTag
+    value: '$(Build.BuildId)-$(Build.SourceVersion)'  # buildId + git SHA for traceability
+
+  # Image names follow pattern: <reponame>/<dockerfilefoldername>
+  - name: imageVote
+    value: 'votingapp/vote'
+  - name: imageResult
+    value: 'votingapp/result'
+  - name: imageWorker
+    value: 'votingapp/worker'
+
+  # Dockerfile paths
+  - name: dockerfilePathVote
+    value: '$(Build.SourcesDirectory)/vote/Dockerfile'
+  - name: dockerfilePathResult
+    value: '$(Build.SourcesDirectory)/result/Dockerfile'
+  - name: dockerfilePathWorker
+    value: '$(Build.SourcesDirectory)/worker/Dockerfile'
+
+# ── Agent Pool ──
+# Self-hosted agent — rename pool name below when needed
+# To switch to Microsoft-hosted, comment out the 'name' line
+# and uncomment the 'vmImage' line
+pool:
+  name: 'SelfHosted-ec2'       # ← rename this to your pool name
+  # vmImage: 'ubuntu-latest'   # ← uncomment when Microsoft-hosted access is available
+
+# ============================================================
+# Stage 1 — Secret Scanning
+# Catches leaked credentials before anything else runs
+# ============================================================
+stages:
+- stage: SecretScan
+  displayName: '🔐 Secret Scanning'
+  jobs:
+  - job: Gitleaks
+    displayName: 'Gitleaks Secret Scan'
+    timeoutInMinutes: 10
+    steps:
+    - checkout: self
+      fetchDepth: 0            # full history needed for git log scanning
+
+    - script: |
+        docker run --rm -v $(Build.SourcesDirectory):/repo \
+          zricethezav/gitleaks:latest detect \
+          --source=/repo \
+          --exit-code=1 \
+          --report-format=json \
+          --report-path=/repo/gitleaks-report.json
+      displayName: 'Run Gitleaks'
+      continueOnError: false   # HARD BLOCK — stop pipeline if secrets found
+
+    - task: PublishBuildArtifacts@1
+      condition: always()
+      inputs:
+        pathToPublish: '$(Build.SourcesDirectory)/gitleaks-report.json'
+        artifactName: 'gitleaks-report'
+
+# ============================================================
+# Stage 2 — SAST (Static Application Security Testing)
+# ============================================================
+- stage: SAST
+  displayName: '🔍 SAST Scanning'
+  dependsOn: SecretScan
+  jobs:
+  - job: Semgrep
+    displayName: 'Semgrep SAST'
+    timeoutInMinutes: 15
+    steps:
+    - script: |
+        pip install semgrep
+        semgrep --config=auto \
+          --json \
+          --output=$(Build.ArtifactStagingDirectory)/semgrep-report.json \
+          --error \
+          vote/ result/ worker/
+      displayName: 'Run Semgrep'
+
+    - task: PublishBuildArtifacts@1
+      condition: always()
+      inputs:
+        pathToPublish: '$(Build.ArtifactStagingDirectory)/semgrep-report.json'
+        artifactName: 'semgrep-report'
+
+# ============================================================
+# Stage 3 — SCA (Software Composition Analysis)
+# Scans dependencies for known CVEs
+# ============================================================
+- stage: SCA
+  displayName: '📦 Dependency Scanning'
+  dependsOn: SecretScan
+  jobs:
+  - job: DependencyCheck
+    displayName: 'OWASP Dependency Check'
+    timeoutInMinutes: 30
+    steps:
+    - task: dependency-check-build-task@6
+      displayName: 'OWASP Dependency Check'
+      inputs:
+        projectName: 'VotingApp'
+        scanPath: '$(Build.SourcesDirectory)'
+        format: 'HTML,JSON'
+        failOnCVSS: '7'                      # fail on HIGH/CRITICAL CVEs
+        suppressionPath: 'suppression.xml'   # known false positives
+
+    - task: PublishBuildArtifacts@1
+      condition: always()
+      inputs:
+        pathToPublish: '$(Common.TestResultsDirectory)'
+        artifactName: 'dependency-check-report'
+
+# ============================================================
+# Stage 4 — Unit Tests
+# Must pass before building Docker images
+# ============================================================
+- stage: Test
+  displayName: '🧪 Unit Tests'
+  dependsOn:
+    - SAST
+    - SCA
+  jobs:
+  - job: TestVote
+    displayName: 'Test Vote App (Python)'
+    timeoutInMinutes: 10
+    steps:
+    - script: |
+        cd vote
+        pip install -r requirements.txt
+        pip install pytest pytest-cov
+        pytest tests/ --junitxml=$(Build.ArtifactStagingDirectory)/vote-test-results.xml \
+          --cov=. --cov-report=xml:$(Build.ArtifactStagingDirectory)/vote-coverage.xml
+      displayName: 'Run Vote Tests'
+
+    - task: PublishTestResults@2
+      condition: always()
+      inputs:
+        testResultsFormat: 'JUnit'
+        testResultsFiles: '$(Build.ArtifactStagingDirectory)/vote-test-results.xml'
+        testRunTitle: 'Vote App Tests'
+
+    - task: PublishCodeCoverageResults@1
+      inputs:
+        codeCoverageTool: 'Cobertura'
+        summaryFileLocation: '$(Build.ArtifactStagingDirectory)/vote-coverage.xml'
+
+  - job: TestWorker
+    displayName: 'Test Worker App (.NET)'
+    timeoutInMinutes: 10
+    steps:
+    - task: DotNetCoreCLI@2
+      displayName: 'Run Worker Tests'
+      inputs:
+        command: 'test'
+        projects: 'worker/**/*.csproj'
+        arguments: '--configuration Release --collect:"XPlat Code Coverage"'
+        publishTestResults: true
+
+# ============================================================
+# Stage 5 — Build Docker Images
+# Only runs after all tests pass
+# ============================================================
+- stage: Build
+  displayName: '🐳 Build Docker Images'
+  dependsOn: Test
+  jobs:
+  - job: BuildVote
+    displayName: 'Build Vote Image'
+    timeoutInMinutes: 20
+    retryCountOnTaskFailure: 2   # retry on transient ACR push failures
+    steps:
+    - task: Docker@2
+      displayName: 'Build Vote Image'
+      inputs:
+        command: build
+        repository: $(imageVote)
+        dockerfile: $(dockerfilePathVote)
+        containerRegistry: $(ACR_SERVICE_CONNECTION)
+        tags: |
+          $(tag)
+          latest
+          $(Build.SourceBranchName)
+        arguments: '--no-cache --label git-commit=$(Build.SourceVersion)'
+
+    - script: |
+        docker save $(imageVote):$(tag) -o $(Build.ArtifactStagingDirectory)/vote-image.tar
+      displayName: 'Save image for scanning'
+
+    - task: PublishBuildArtifacts@1
+      inputs:
+        pathToPublish: '$(Build.ArtifactStagingDirectory)/vote-image.tar'
+        artifactName: 'vote-image'
+
+  - job: BuildResult
+    displayName: 'Build Result Image'
+    timeoutInMinutes: 20
+    retryCountOnTaskFailure: 2
+    steps:
+    - task: Docker@2
+      displayName: 'Build Result Image'
+      inputs:
+        command: build
+        repository: $(imageResult)
+        dockerfile: $(dockerfilePathResult)
+        containerRegistry: $(ACR_SERVICE_CONNECTION)
+        tags: |
+          $(tag)
+          latest
+          $(Build.SourceBranchName)
+        arguments: '--no-cache --label git-commit=$(Build.SourceVersion)'
+
+  - job: BuildWorker
+    displayName: 'Build Worker Image'
+    timeoutInMinutes: 20
+    retryCountOnTaskFailure: 2
+    steps:
+    - task: Docker@2
+      displayName: 'Build Worker Image'
+      inputs:
+        command: build
+        repository: $(imageWorker)
+        dockerfile: $(dockerfilePathWorker)
+        containerRegistry: $(ACR_SERVICE_CONNECTION)
+        tags: |
+          $(tag)
+          latest
+          $(Build.SourceBranchName)
+        arguments: '--no-cache --label git-commit=$(Build.SourceVersion)'
+
+# ============================================================
+# Stage 6 — Container Scanning (Trivy)
+# Scans built images for CVEs before pushing to ACR
+# ============================================================
+- stage: ContainerScan
+  displayName: '🛡️ Container Scanning'
+  dependsOn: Build
+  jobs:
+  - job: TrivyScan
+    displayName: 'Trivy Image Scan'
+    timeoutInMinutes: 20
+    steps:
+    - script: |
+        curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+
+        echo "==> Scanning vote image..."
+        trivy image --exit-code 1 \
+          --severity HIGH,CRITICAL \
+          --format json \
+          --output $(Build.ArtifactStagingDirectory)/trivy-vote.json \
+          $(imageVote):$(tag)
+
+        echo "==> Scanning result image..."
+        trivy image --exit-code 1 \
+          --severity HIGH,CRITICAL \
+          --format json \
+          --output $(Build.ArtifactStagingDirectory)/trivy-result.json \
+          $(imageResult):$(tag)
+
+        echo "==> Scanning worker image..."
+        trivy image --exit-code 1 \
+          --severity HIGH,CRITICAL \
+          --format json \
+          --output $(Build.ArtifactStagingDirectory)/trivy-worker.json \
+          $(imageWorker):$(tag)
+      displayName: 'Trivy Scan All Images'
+      continueOnError: false   # HARD BLOCK on HIGH/CRITICAL CVEs
+
+    - task: PublishBuildArtifacts@1
+      condition: always()
+      inputs:
+        pathToPublish: '$(Build.ArtifactStagingDirectory)'
+        artifactName: 'trivy-reports'
+
+# ============================================================
+# Stage 7 — Push to ACR
+# Only runs after all scans pass and only on main/release branches
+# ============================================================
+- stage: Push
+  displayName: '📤 Push to ACR'
+  dependsOn: ContainerScan
+  condition: |
+    and(
+      succeeded(),
+      or(
+        eq(variables['Build.SourceBranch'], 'refs/heads/main'),
+        startsWith(variables['Build.SourceBranch'], 'refs/heads/release/')
+      )
+    )
+  jobs:
+  - job: PushImages
+    displayName: 'Push All Images to ACR'
+    timeoutInMinutes: 20
+    retryCountOnTaskFailure: 2
+    steps:
+    - task: Docker@2
+      displayName: 'Push Vote Image'
+      inputs:
+        command: push
+        repository: $(imageVote)
+        containerRegistry: $(ACR_SERVICE_CONNECTION)
+        tags: |
+          $(tag)
+          latest
+          $(Build.SourceBranchName)
+
+    - task: Docker@2
+      displayName: 'Push Result Image'
+      inputs:
+        command: push
+        repository: $(imageResult)
+        containerRegistry: $(ACR_SERVICE_CONNECTION)
+        tags: |
+          $(tag)
+          latest
+          $(Build.SourceBranchName)
+
+    - task: Docker@2
+      displayName: 'Push Worker Image'
+      inputs:
+        command: push
+        repository: $(imageWorker)
+        containerRegistry: $(ACR_SERVICE_CONNECTION)
+        tags: |
+          $(tag)
+          latest
+          $(Build.SourceBranchName)
+
+    - script: |
+        echo "##vso[task.setvariable variable=IMAGE_TAG;isOutput=true]$(tag)"
+      name: setTag
+      displayName: 'Export image tag for CD pipeline'
+
+# ============================================================
+# Failure Notification
+# ============================================================
+- stage: Notify
+  displayName: '🔔 Notify on Failure'
+  dependsOn:
+    - SecretScan
+    - SAST
+    - SCA
+    - Test
+    - Build
+    - ContainerScan
+    - Push
+  condition: failed()
+  jobs:
+  - job: SendNotification
+    steps:
+    - task: SendEmailNotification@1
+      inputs:
+        subject: '❌ VotingApp CI Pipeline Failed — Build $(Build.BuildId)'
+        body: |
+          Pipeline failed on branch: $(Build.SourceBranch)
+          Triggered by: $(Build.RequestedFor)
+          Build URL: $(System.TeamFoundationCollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)
+        toAddress: '$(NOTIFICATION_EMAIL)'

@@ -1,0 +1,475 @@
+# ============================================================
+# Production CD Pipeline — VotingApp
+# Deploys to AKS after CI pipeline completes successfully
+#
+# Flow:
+#   CI Pipeline completes
+#       ↓
+#   UpdateManifests  — patch image tags in k8s-specifications
+#       ↓
+#   DeployDev        — deploy to voting-app-dev namespace
+#       ↓
+#   SmokeTestDev     — verify pods are healthy in dev
+#       ↓
+#   ApprovalGate     — manual approval before production
+#       ↓
+#   DeployProd       — deploy to voting-app namespace (production)
+#       ↓
+#   HealthCheckProd  — verify all pods Running + services have External IP
+#       ↓
+#   Notify           — success or failure notification
+# ============================================================
+
+# Triggered by CI pipeline completing successfully
+trigger: none   # CD is NOT triggered by code push directly
+
+resources:
+  pipelines:
+  - pipeline: ci-pipeline               # reference to CI pipeline
+    source: 'VotingApp-CI'              # name of CI pipeline in Azure DevOps
+    trigger:
+      branches:
+        include:
+          - main
+          - release/*
+
+# ── Variable Group from Azure DevOps Library ──
+# votingapp-cd-variables must contain:
+#   AKS_SERVICE_CONNECTION  — AKS service connection name
+#   ACR_LOGIN_SERVER        — e.g. votingappvishal.azurecr.io
+#   NOTIFICATION_EMAIL      — email for alerts
+#   ACR_SERVICE_CONNECTION  — ACR service connection name
+variables:
+  - group: votingapp-cd-variables
+
+  # Image names — reponame/dockerfilefoldername (matches CI pipeline)
+  - name: imageVote
+    value: '$(ACR_LOGIN_SERVER)/votingapp/vote'
+  - name: imageResult
+    value: '$(ACR_LOGIN_SERVER)/votingapp/result'
+  - name: imageWorker
+    value: '$(ACR_LOGIN_SERVER)/votingapp/worker'
+
+  # Namespaces
+  - name: devNamespace
+    value: 'voting-app-dev'
+  - name: prodNamespace
+    value: 'voting-app'
+
+  # Image tag from CI pipeline
+  - name: imageTag
+    value: '$(resources.pipeline.ci-pipeline.runID)'
+
+# ── Agent Pool ──
+# Self-hosted agent — rename pool name below when needed
+# To switch to Microsoft-hosted, comment out 'name' and uncomment 'vmImage'
+pool:
+  name: 'SelfHosted-ec2'       # ← rename this to your pool name
+  # vmImage: 'ubuntu-latest'   # ← uncomment when Microsoft-hosted available
+
+# ============================================================
+# Stage 1 — Update Image Tags in K8s Manifests
+# Replaces placeholder image with real ACR image + build tag
+# ============================================================
+stages:
+- stage: UpdateManifests
+  displayName: '📝 Update Image Tags'
+  jobs:
+  - job: PatchManifests
+    displayName: 'Patch k8s-specifications with new image tags'
+    timeoutInMinutes: 5
+    steps:
+    - checkout: self
+      persistCredentials: true   # needed for git push back to repo
+
+    - script: |
+        echo "==> Patching vote deployment image..."
+        sed -i "s|image:.*vote.*|image: $(imageVote):$(imageTag)|g" \
+          k8s-specifications/vote-deployment.yaml
+
+        echo "==> Patching result deployment image..."
+        sed -i "s|image:.*result.*|image: $(imageResult):$(imageTag)|g" \
+          k8s-specifications/result-deployment.yaml
+
+        echo "==> Patching worker deployment image..."
+        sed -i "s|image:.*worker.*|image: $(imageWorker):$(imageTag)|g" \
+          k8s-specifications/worker-deployment.yaml
+
+        echo "==> Updated manifests:"
+        grep "image:" k8s-specifications/vote-deployment.yaml
+        grep "image:" k8s-specifications/result-deployment.yaml
+        grep "image:" k8s-specifications/worker-deployment.yaml
+      displayName: 'Substitute image tags in manifests'
+
+    - script: |
+        git config user.email "azuredevops@votingapp.com"
+        git config user.name "Azure DevOps CD"
+        git add k8s-specifications/vote-deployment.yaml
+        git add k8s-specifications/result-deployment.yaml
+        git add k8s-specifications/worker-deployment.yaml
+        git commit -m "cd: update image tags to $(imageTag) [skip ci]"
+        git push origin HEAD:main
+      displayName: 'Commit updated manifests to Git'
+      # [skip ci] prevents CI from re-triggering on this commit
+
+    - task: PublishBuildArtifacts@1
+      inputs:
+        pathToPublish: 'k8s-specifications'
+        artifactName: 'k8s-manifests'
+
+# ============================================================
+# Stage 2 — Deploy to Dev
+# Safe environment to verify before production
+# ============================================================
+- stage: DeployDev
+  displayName: '🚀 Deploy to Dev'
+  dependsOn: UpdateManifests
+  jobs:
+  - deployment: DeployToDev
+    displayName: 'Deploy to voting-app-dev namespace'
+    timeoutInMinutes: 15
+    environment: 'votingapp-dev'         # Azure DevOps Environment — tracks deployments
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - download: current
+            artifact: k8s-manifests
+
+          - task: KubernetesManifest@1
+            displayName: 'Create Dev Namespace'
+            inputs:
+              action: createSecret         # ensure namespace exists
+              connectionType: azureResourceManager
+              azureSubscriptionConnection: $(AKS_SERVICE_CONNECTION)
+              azureResourceGroup: 'voting-app-rg'
+              kubernetesCluster: 'voting-aks'
+              namespace: $(devNamespace)
+              secretType: generic
+              secretName: 'acr-pull-secret'
+              secretArguments: '--from-literal=placeholder=true'
+
+          - task: KubernetesManifest@1
+            displayName: 'Deploy All Apps to Dev'
+            inputs:
+              action: deploy
+              connectionType: azureResourceManager
+              azureSubscriptionConnection: $(AKS_SERVICE_CONNECTION)
+              azureResourceGroup: 'voting-app-rg'
+              kubernetesCluster: 'voting-aks'
+              namespace: $(devNamespace)
+              manifests: |
+                $(Pipeline.Workspace)/k8s-manifests/vote-deployment.yaml
+                $(Pipeline.Workspace)/k8s-manifests/vote-service.yaml
+                $(Pipeline.Workspace)/k8s-manifests/result-deployment.yaml
+                $(Pipeline.Workspace)/k8s-manifests/result-service.yaml
+                $(Pipeline.Workspace)/k8s-manifests/worker-deployment.yaml
+                $(Pipeline.Workspace)/k8s-manifests/redis-deployment.yaml
+                $(Pipeline.Workspace)/k8s-manifests/redis-service.yaml
+                $(Pipeline.Workspace)/k8s-manifests/db-deployment.yaml
+                $(Pipeline.Workspace)/k8s-manifests/db-service.yaml
+              containers: |
+                $(imageVote):$(imageTag)
+                $(imageResult):$(imageTag)
+                $(imageWorker):$(imageTag)
+              imagePullSecrets: |
+                acr-auth
+
+# ============================================================
+# Stage 3 — Smoke Test Dev
+# Verify pods are healthy before promoting to production
+# ============================================================
+- stage: SmokeTestDev
+  displayName: '🔬 Smoke Test Dev'
+  dependsOn: DeployDev
+  jobs:
+  - job: SmokeTest
+    displayName: 'Verify Dev Deployment Health'
+    timeoutInMinutes: 10
+    steps:
+    - task: Kubernetes@1
+      displayName: 'Wait for vote rollout'
+      inputs:
+        connectionType: azureResourceManager
+        azureSubscriptionEndpoint: $(AKS_SERVICE_CONNECTION)
+        azureResourceGroup: 'voting-app-rg'
+        kubernetesCluster: 'voting-aks'
+        namespace: $(devNamespace)
+        command: rollout
+        arguments: 'status deployment/vote --timeout=5m'
+
+    - task: Kubernetes@1
+      displayName: 'Wait for result rollout'
+      inputs:
+        connectionType: azureResourceManager
+        azureSubscriptionEndpoint: $(AKS_SERVICE_CONNECTION)
+        azureResourceGroup: 'voting-app-rg'
+        kubernetesCluster: 'voting-aks'
+        namespace: $(devNamespace)
+        command: rollout
+        arguments: 'status deployment/result --timeout=5m'
+
+    - task: Kubernetes@1
+      displayName: 'Wait for worker rollout'
+      inputs:
+        connectionType: azureResourceManager
+        azureSubscriptionEndpoint: $(AKS_SERVICE_CONNECTION)
+        azureResourceGroup: 'voting-app-rg'
+        kubernetesCluster: 'voting-aks'
+        namespace: $(devNamespace)
+        command: rollout
+        arguments: 'status deployment/worker --timeout=5m'
+
+    - task: Kubernetes@1
+      displayName: 'Get all pods in dev'
+      inputs:
+        connectionType: azureResourceManager
+        azureSubscriptionEndpoint: $(AKS_SERVICE_CONNECTION)
+        azureResourceGroup: 'voting-app-rg'
+        kubernetesCluster: 'voting-aks'
+        namespace: $(devNamespace)
+        command: get
+        arguments: 'pods -o wide'
+
+    - script: |
+        echo "==> Checking vote service external IP..."
+        VOTE_IP=""
+        for i in $(seq 1 12); do
+          VOTE_IP=$(kubectl get svc vote -n $(devNamespace) \
+            -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null)
+          if [ -n "$VOTE_IP" ]; then
+            echo "Vote service IP: $VOTE_IP"
+            break
+          fi
+          echo "Attempt $i — waiting for IP..."
+          sleep 10
+        done
+
+        if [ -z "$VOTE_IP" ]; then
+          echo "ERROR: vote service did not get external IP"
+          exit 1
+        fi
+
+        echo "==> Smoke testing vote endpoint..."
+        HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://$VOTE_IP:8080)
+        if [ "$HTTP_STATUS" != "200" ]; then
+          echo "ERROR: vote app returned HTTP $HTTP_STATUS"
+          exit 1
+        fi
+        echo "Vote app responded HTTP 200 ✅"
+      displayName: 'HTTP smoke test — vote app'
+
+# ============================================================
+# Stage 4 — Production Approval Gate
+# Requires manual approval before deploying to production
+# ============================================================
+- stage: ApprovalGate
+  displayName: '✋ Production Approval'
+  dependsOn: SmokeTestDev
+  jobs:
+  - job: WaitForApproval
+    displayName: 'Waiting for manual approval...'
+    timeoutInMinutes: 1440   # 24 hours to approve before pipeline expires
+    pool: server              # server job — no agent needed for approval
+    steps:
+    - task: ManualValidation@0
+      displayName: 'Approve Production Deployment'
+      timeoutInMinutes: 1440
+      inputs:
+        notifyUsers: '$(NOTIFICATION_EMAIL)'
+        instructions: |
+          ✅ Dev deployment verified successfully.
+
+          Image tag: $(imageTag)
+          Dev namespace: $(devNamespace)
+
+          Please review the dev environment before approving production deployment:
+          - Vote app is running and healthy
+          - Result app is running and healthy
+          - Worker is processing votes
+
+          Approve to deploy to PRODUCTION namespace: $(prodNamespace)
+        onTimeout: 'reject'  # auto-reject if nobody approves within 24h
+
+# ============================================================
+# Stage 5 — Deploy to Production
+# Rolling update strategy — zero downtime
+# ============================================================
+- stage: DeployProd
+  displayName: '🏭 Deploy to Production'
+  dependsOn: ApprovalGate
+  jobs:
+  - deployment: DeployToProduction
+    displayName: 'Deploy to voting-app namespace (production)'
+    timeoutInMinutes: 20
+    environment: 'votingapp-production'  # separate Azure DevOps Environment for prod
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - download: current
+            artifact: k8s-manifests
+
+          - task: KubernetesManifest@1
+            displayName: 'Deploy to Production'
+            inputs:
+              action: deploy
+              connectionType: azureResourceManager
+              azureSubscriptionConnection: $(AKS_SERVICE_CONNECTION)
+              azureResourceGroup: 'voting-app-rg'
+              kubernetesCluster: 'voting-aks'
+              namespace: $(prodNamespace)
+              manifests: |
+                $(Pipeline.Workspace)/k8s-manifests/vote-deployment.yaml
+                $(Pipeline.Workspace)/k8s-manifests/vote-service.yaml
+                $(Pipeline.Workspace)/k8s-manifests/result-deployment.yaml
+                $(Pipeline.Workspace)/k8s-manifests/result-service.yaml
+                $(Pipeline.Workspace)/k8s-manifests/worker-deployment.yaml
+                $(Pipeline.Workspace)/k8s-manifests/redis-deployment.yaml
+                $(Pipeline.Workspace)/k8s-manifests/redis-service.yaml
+                $(Pipeline.Workspace)/k8s-manifests/db-deployment.yaml
+                $(Pipeline.Workspace)/k8s-manifests/db-service.yaml
+              containers: |
+                $(imageVote):$(imageTag)
+                $(imageResult):$(imageTag)
+                $(imageWorker):$(imageTag)
+              imagePullSecrets: |
+                acr-auth
+
+# ============================================================
+# Stage 6 — Health Check Production
+# Verify production deployment is fully healthy
+# Rollback automatically if health check fails
+# ============================================================
+- stage: HealthCheckProd
+  displayName: '❤️ Production Health Check'
+  dependsOn: DeployProd
+  jobs:
+  - job: HealthCheck
+    displayName: 'Verify Production Health'
+    timeoutInMinutes: 15
+    steps:
+    - task: Kubernetes@1
+      displayName: 'Rollout status — vote'
+      inputs:
+        connectionType: azureResourceManager
+        azureSubscriptionEndpoint: $(AKS_SERVICE_CONNECTION)
+        azureResourceGroup: 'voting-app-rg'
+        kubernetesCluster: 'voting-aks'
+        namespace: $(prodNamespace)
+        command: rollout
+        arguments: 'status deployment/vote --timeout=5m'
+
+    - task: Kubernetes@1
+      displayName: 'Rollout status — result'
+      inputs:
+        connectionType: azureResourceManager
+        azureSubscriptionEndpoint: $(AKS_SERVICE_CONNECTION)
+        azureResourceGroup: 'voting-app-rg'
+        kubernetesCluster: 'voting-aks'
+        namespace: $(prodNamespace)
+        command: rollout
+        arguments: 'status deployment/result --timeout=5m'
+
+    - task: Kubernetes@1
+      displayName: 'Rollout status — worker'
+      inputs:
+        connectionType: azureResourceManager
+        azureSubscriptionEndpoint: $(AKS_SERVICE_CONNECTION)
+        azureResourceGroup: 'voting-app-rg'
+        kubernetesCluster: 'voting-aks'
+        namespace: $(prodNamespace)
+        command: rollout
+        arguments: 'status deployment/worker --timeout=5m'
+
+    - task: Kubernetes@1
+      displayName: 'Get all production pods'
+      inputs:
+        connectionType: azureResourceManager
+        azureSubscriptionEndpoint: $(AKS_SERVICE_CONNECTION)
+        azureResourceGroup: 'voting-app-rg'
+        kubernetesCluster: 'voting-aks'
+        namespace: $(prodNamespace)
+        command: get
+        arguments: 'pods,svc -o wide'
+
+    - script: |
+        echo "==> Verifying production vote endpoint..."
+        VOTE_IP=$(kubectl get svc vote -n $(prodNamespace) \
+          -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+        RESULT_IP=$(kubectl get svc result -n $(prodNamespace) \
+          -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+
+        echo "Vote IP: $VOTE_IP"
+        echo "Result IP: $RESULT_IP"
+
+        VOTE_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://$VOTE_IP:8080)
+        RESULT_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://$RESULT_IP:8081)
+
+        echo "Vote HTTP: $VOTE_STATUS"
+        echo "Result HTTP: $RESULT_STATUS"
+
+        if [ "$VOTE_STATUS" != "200" ] || [ "$RESULT_STATUS" != "200" ]; then
+          echo "❌ Production health check FAILED — triggering rollback..."
+          kubectl rollout undo deployment/vote -n $(prodNamespace)
+          kubectl rollout undo deployment/result -n $(prodNamespace)
+          kubectl rollout undo deployment/worker -n $(prodNamespace)
+          echo "✅ Rollback complete"
+          exit 1
+        fi
+
+        echo "✅ Production health check PASSED"
+        echo "Vote:   http://$VOTE_IP:8080"
+        echo "Result: http://$RESULT_IP:8081"
+      displayName: 'HTTP health check + auto rollback on failure'
+
+# ============================================================
+# Stage 7 — Notify
+# Send success or failure notification
+# ============================================================
+- stage: Notify
+  displayName: '🔔 Notify'
+  dependsOn:
+    - UpdateManifests
+    - DeployDev
+    - SmokeTestDev
+    - ApprovalGate
+    - DeployProd
+    - HealthCheckProd
+  condition: always()
+  jobs:
+  - job: NotifySuccess
+    displayName: 'Notify Success'
+    condition: succeeded()
+    steps:
+    - task: SendEmailNotification@1
+      inputs:
+        subject: '✅ VotingApp CD — Build $(imageTag) deployed to Production'
+        body: |
+          Deployment successful!
+
+          Image Tag  : $(imageTag)
+          Namespace  : $(prodNamespace)
+          Cluster    : voting-aks
+          Triggered by: $(Build.RequestedFor)
+
+          Pipeline: $(System.TeamFoundationCollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)
+        toAddress: '$(NOTIFICATION_EMAIL)'
+
+  - job: NotifyFailure
+    displayName: 'Notify Failure'
+    condition: failed()
+    steps:
+    - task: SendEmailNotification@1
+      inputs:
+        subject: '❌ VotingApp CD FAILED — Build $(imageTag)'
+        body: |
+          Deployment FAILED or was rolled back!
+
+          Image Tag  : $(imageTag)
+          Namespace  : $(prodNamespace)
+          Triggered by: $(Build.RequestedFor)
+
+          Check pipeline for details:
+          $(System.TeamFoundationCollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)
+        toAddress: '$(NOTIFICATION_EMAIL)'

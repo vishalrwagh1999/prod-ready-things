@@ -1,0 +1,87 @@
+# Docker
+# Build and push an image to Azure Container Registry
+# https://docs.microsoft.com/azure/devops/pipelines/languages/docker
+
+trigger:
+#- main #if anything chnages in this branch run pipeline automatically.
+  paths:
+    include:  #if anything chnages in below path on folder run pipeline autimaticallty
+      - vote/*  #the repo we are using in side it Dockerfile is present.
+      - result/*   
+      - worker/*
+
+resources:
+- repo: self
+
+variables:
+  # Container registry service connection established during pipeline creation
+  dockerRegistryServiceConnection: '774bd28a-0ff8-4bb1-8235-002f2aa7b24e'
+  imageRepository: 'votingapp'
+  containerRegistry: 'votingappvishal.azurecr.io'
+  dockerfilePathvote: '$(Build.SourcesDirectory)/vote/Dockerfile'
+  dockerfilePathresult: '$(Build.SourcesDirectory)/result/Dockerfile'
+  dockerfilePathworker: '$(Build.SourcesDirectory)/worker/Dockerfile'
+  tag: '$(Build.BuildId)'
+#  vmImageName: 'SelfHosted-ec2'
+pool:
+  name: 'SelfHosted-ec2' # Replace with your actual pool name
+
+  # Agent VM image name
+  #vmImageName: 'ubuntu-latest'
+  
+
+stages:
+- stage: Vote
+  displayName: Build and push stage vote image
+  jobs:
+  - job: BuildVote
+    displayName: Build
+    #pool:
+    #  vmImage: $(vmImageName)
+    steps:
+    - task: Docker@2
+      displayName: Build and push an image to container registry
+      inputs:
+        command: buildAndPush
+        repository: $(imageRepository)
+        dockerfile: $(dockerfilePathvote)
+        containerRegistry: $(dockerRegistryServiceConnection)
+        tags: |
+          $(tag)
+
+- stage: Result
+  displayName: Build and push stage result image
+  jobs:
+  - job: BuildResult
+    displayName: Build
+    #pool:
+    #  vmImage: $(vmImageName)
+    steps:
+    - task: Docker@2
+      displayName: Build and push an image to container registry
+      inputs:
+        command: buildAndPush
+        repository: $(imageRepository)
+        dockerfile: $(dockerfilePathresult)
+        containerRegistry: $(dockerRegistryServiceConnection)
+        tags: |
+          $(tag)
+
+- stage: Worker
+  displayName: Build and push stage worker image
+  jobs:
+  - job: BuildWorker
+    displayName: Build
+    #pool:
+    #  vmImage: $(vmImageName)
+    steps:
+    - task: Docker@2
+      displayName: Build and push an image to container registry
+      inputs:
+        command: buildAndPush
+        repository: $(imageRepository)
+        dockerfile: $(dockerfilePathworker)
+        containerRegistry: $(dockerRegistryServiceConnection)
+        tags: |
+          $(tag)                    
+
