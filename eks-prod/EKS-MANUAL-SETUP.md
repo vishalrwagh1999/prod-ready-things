@@ -530,6 +530,10 @@ spec:
               number: 80
 ```
 
+kubectl apply -f app1.yml   &&  kubectl port-forward --address 0.0.0.0 svc/app1-service 8080:80
+kubectl apply -f app2.yml   &&  kubectl port-forward --address 0.0.0.0 svc/app2-service 8081:80
+
+
 ```bash
 kubectl apply -f ingress.yaml
 
