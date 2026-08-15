@@ -12,7 +12,7 @@ Your App (Pod)
      |
   Ingress  <-- AWS Load Balancer Controller manages this ALB
      |
-  Service Account  <-- has an IAM Role attached (IRSA)
+  Service Account  <-- has an IAM Role attached (IRSA) IRSA stands for IAM Roles for Service Accounts
      |
   OIDC Provider  <-- trust bridge between Kubernetes and AWS IAM
      |
@@ -140,7 +140,7 @@ aws iam attach-role-policy --role-name eks-node-role \
 
 ---
 
-### Role 3 — AWS Load Balancer Controller Role (IRSA Role)
+### Role 3 — AWS Load Balancer Controller Role (IRSA Role)     IRSA stands for IAM Roles for Service Accounts
 
 **What it is:** An IAM role for the **Load Balancer Controller pod** running inside Kubernetes.
 
